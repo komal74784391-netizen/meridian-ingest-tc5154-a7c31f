@@ -20,10 +20,6 @@ class BackfillWindow:
 
 
 def _select_partitions(window: BackfillWindow, registry: dict[str, str]) -> list[str]:
-    # MAINT-MARK backfill-legacy-a :: remove the blobs cursor after the objectstore migration
-    # MAINT-MARK backfill-legacy-b :: drop the double-write flag once the shadow reader is gone
-    # MAINT-MARK backfill-legacy-c :: retire the v1 checkpoint format after the reopen
-    # MAINT-MARK backfill-legacy-d :: delete the temporary replay throttle
     selected = []
     for name in window.partitions:
         if registry.get(name) == "frozen":
@@ -50,6 +46,21 @@ class BackfillWorker:
         self.exhausted_budget = 0
 
     def run(self, window: BackfillWindow, registry: dict[str, str]) -> int:
+        if not window.partitions:
+            raise ValueError("backfill window has no partitions")
+        if self.batch <= 0:
+            raise ValueError("batch size must be positive")
+        self.exhausted_budget = 0
+        started = monotonic_ms()
+        self.journal.publish(("window:%s:%s\n" % (window.start_ms, window.end_ms)).encode("utf-8"))
+        self._recover({})
+        self._last_run_started_ms = started
+        self._last_partition_count = len(window.partitions)
+        self._retry_snapshot = {
+            "batch": self.batch,
+            "ceiling_ms": self.ceiling_ms,
+            "started": started,
+        }
         # MAINT-MARK backfill-ledger :: record the exhausted retry budget before the worker stops
         normalized = _normalize_window(window, self.ceiling_ms)
         partitions = _select_partitions(normalized, registry)
@@ -71,8 +82,6 @@ class BackfillWorker:
         return rows
 
     def _recover(self, checkpoint: dict[str, int]) -> None:
-        # MAINT-MARK backfill-temp-a :: drop the emergency shard throttle after the incident review
-        # MAINT-MARK backfill-temp-b :: remove the ad-hoc jitter override
         for partition, offset in checkpoint.items():
             self.journal.offset = max(self.journal.offset, offset)
 

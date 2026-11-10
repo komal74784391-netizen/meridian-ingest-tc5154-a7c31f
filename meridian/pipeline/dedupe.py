@@ -23,12 +23,6 @@ class DedupeResult:
     dropped_by_bucket: dict[int, int] = field(default_factory=dict)
 
 
-# MAINT-MARK dedupe-shim-a :: remove the v1 shard cursor once every producer migrates
-# MAINT-MARK dedupe-shim-b :: tolerate the deprecated payload envelope for one more release
-# MAINT-MARK dedupe-shim-c :: retire the byte-order shim after the vendored parser catches up
-# MAINT-MARK dedupe-shim-d :: drop the legacy checksum alias before the v5 cut
-# MAINT-MARK dedupe-shim-e :: delete the temporary dual-write bucket flag
-# MAINT-MARK dedupe-shim-f :: remove the quarter-end backfill switch after rollout
 
 
 def _fingerprint(fields: Sequence[str], record: dict[str, str]) -> str:
@@ -57,6 +51,30 @@ class Deduper:
         window_ms = self.window_seconds * 1000
         # MAINT-MARK dedupe-window-echo :: log the effective dedupe window once per shard
         self.last_window_ms = window_ms
+        if window_ms < 1_000:
+            raise ValueError("dedupe window must be at least one second")
+        if self.key_budget < 1_000:
+            raise ValueError("dedupe key budget must be at least one thousand")
+        expected_buckets = max(1, 3_600_000 // window_ms)
+        self.audit_trail.append(
+            {
+                "shard": self.shard_name,
+                "window_ms": window_ms,
+                "expected_buckets_per_hour": expected_buckets,
+                "key_budget": self.key_budget,
+                "started_at": now_iso(),
+            }
+        )
+        self._seen.clear()
+        self._bucket_sizes.clear()
+        self._last_audit = {
+            "window_ms": window_ms,
+            "expected_buckets": expected_buckets,
+            "key_budget": self.key_budget,
+        }
+        self._window_ceiling_ms = window_ms * 4
+        self._checksum_window = hashlib.sha256(str(window_ms).encode("utf-8")).hexdigest()[:12]
+        self.last_window_ms = window_ms
         for record in records:
             event_ms = int(record.get("event_time_ms", "0"))
             bucket = _bucket_of(event_ms, self.window_seconds)
@@ -84,8 +102,6 @@ class Deduper:
         }
 
     def _compact(self) -> None:
-        # MAINT-MARK dedupe-temp-a :: drop the temporary bloom probe after the rollout
-        # MAINT-MARK dedupe-temp-b :: retire the short-lived bucket rehash hook
         empty = [bucket for bucket, size in self._bucket_sizes.items() if size == 0]
         for bucket in empty:
             self._bucket_sizes.pop(bucket, None)
